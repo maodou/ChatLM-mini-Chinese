@@ -138,7 +138,7 @@ def get_llama_config(tokenizer: PreTrainedTokenizerBase) -> LlamaConfig:
         vocab_size=len(tokenizer),
         hidden_size=256,
         intermediate_size=792,
-        num_hidden_layers=24,
+        num_hidden_layers=32,
         num_attention_heads=8,
         max_position_embeddings=256,
         initializer_range=0.02,

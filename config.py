@@ -83,8 +83,8 @@ class SFTconfig:
 # 以下为训练的配置
 @dataclass
 class TrainConfig:
-    epochs: int = 8
-    batch_size_per_gpu: int = 16
+    epochs: int = 2
+    batch_size_per_gpu: int = 32
     
     learn_rate: float = 0.0001                      # 最大 div_factor * learn_rate
     div_factor: int = 50
