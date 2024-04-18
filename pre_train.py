@@ -4,14 +4,17 @@ import os
 import pandas as pd 
 from dataclasses import dataclass
 import torch
-from typing import Dict
+from typing import Dict, List, Union, Any
 
 from tqdm import tqdm
 import numpy as np
-from transformers import PreTrainedTokenizerFast, Seq2SeqTrainer, DataCollatorForSeq2Seq, Seq2SeqTrainingArguments
+from transformers import PreTrainedTokenizerFast, Seq2SeqTrainer, DataCollatorForSeq2Seq, Seq2SeqTrainingArguments, \
+    DataCollatorForLanguageModeling, TrainingArguments, LlamaForCausalLM, AutoTokenizer, PreTrainedTokenizerBase, \
+    LlamaConfig
 
 from transformers.generation.configuration_utils import GenerationConfig
 from datasets import Dataset, load_dataset
+from trl import SFTTrainer
 
 from model.chat_model import TextToTextModel
 from model.dataset import MyDataset
@@ -103,7 +106,7 @@ def pre_train(config: TrainConfig) -> None:
 
     # step 6: init my collator,
     collator = DataCollatorForSeq2Seq(tokenizer, max_length=config.max_seq_len)
-    empty_cuda_cahce = MyTrainerCallback()
+    empty_cuda_cache = MyTrainerCallback()
 
     # Step 7: Define the Trainer
     trainer = Seq2SeqTrainer(
@@ -112,7 +115,7 @@ def pre_train(config: TrainConfig) -> None:
         train_dataset=dataset,
         tokenizer=tokenizer,
         data_collator=collator,
-        callbacks=[empty_cuda_cahce],
+        callbacks=[empty_cuda_cache],
     )
 
     # step 8: train
@@ -130,7 +133,126 @@ def pre_train(config: TrainConfig) -> None:
     # Step 10: Save the model
     trainer.save_model(config.output_dir)
 
+def get_llama_config(tokenizer: PreTrainedTokenizerBase) -> LlamaConfig:
+    return LlamaConfig(
+        vocab_size=len(tokenizer),
+        hidden_size=256,
+        intermediate_size=792,
+        num_hidden_layers=24,
+        num_attention_heads=8,
+        max_position_embeddings=256,
+        initializer_range=0.02,
+        pad_token_id=tokenizer.pad_token_id,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        tie_word_embeddings=True,
+    )
+
+
+def pre_train_llama(config: TrainConfig):
+    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_dir)
+    llama_config = get_llama_config(tokenizer)
+    model = LlamaForCausalLM(llama_config)
+
+    dataset = get_dataset_llama(file=config.train_file, split='train', tokenizer=tokenizer)
+
+    dataset = dataset.select(range(200000))
+
+    generation_config = GenerationConfig()
+    generation_config.remove_invalid_values = True
+    generation_config.eos_token_id = tokenizer.eos_token_id
+    generation_config.pad_token_id = tokenizer.pad_token_id
+    generation_config.decoder_start_token_id = tokenizer.pad_token_id
+    generation_config.max_new_tokens = 320
+    generation_config.num_beams = 1  # greedy search
+    generation_config.do_sample = False  # greedy search
+
+    training_args = TrainingArguments(
+        output_dir=config.output_dir,
+        # per_device_train_batch_size=config.batch_size_per_gpu,
+        per_device_train_batch_size=config.batch_size_per_gpu,
+        auto_find_batch_size=True,  # 防止OOM
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        learning_rate=config.learn_rate,
+        logging_steps=config.logging_steps,
+        num_train_epochs=config.epochs,
+        optim="adafactor",
+        # report_to='tensorboard',
+        log_level='info',
+        save_steps=config.save_steps,
+        save_total_limit=3,
+        fp16=True if config.mixed_precision == 'fp16' else False,
+        bf16=True if config.mixed_precision == 'bf16' else False,
+        logging_first_step=True,
+        warmup_steps=config.warmup_steps,
+        seed=config.seed,
+        # generation_config=generation_config,
+        # generation_max_length=config.max_seq_len,
+    )
+
+    collator = MyDataCollator(tokenizer=tokenizer, mlm=False)
+    empty_cuda_cache = MyTrainerCallback()
+    trainer = SFTTrainer(model=model,
+                         args=training_args,
+                         train_dataset=dataset,
+                         tokenizer=tokenizer,
+                         data_collator=collator,
+                         dataset_text_field='text',
+                         callbacks=[empty_cuda_cache])
+
+    trainer.train()
+
+    # step 9: save log
+    loss_log = pd.DataFrame(trainer.state.log_history)
+    log_dir = './logs'
+    if not os.path.exists(log_dir):
+        os.mkdir(log_dir)
+    loss_log.to_csv(f"{log_dir}/pre_train_log_{time.strftime('%Y%m%d-%H%M')}.csv")
+
+    # Step 10: Save the model
+    trainer.save_model(config.output_dir)
+
+
+def get_dataset_llama(file: str, split: str, tokenizer: PreTrainedTokenizerFast, cache_dir: str = '.cache') -> Dataset:
+    """
+    加载数据集
+    """
+    dataset = load_dataset('parquet', data_files=file, split=split, cache_dir=cache_dir)
+
+    def tokens_to_ids(samples: dict) -> Dict[str, str]:
+        eos_token_id = tokenizer.eos_token_id
+
+        batch_prompt = samples['prompt']
+        batch_response = samples['response']
+
+        # encoded_prompt = tokenizer(batch_prompt, truncation=False, padding=False, return_attention_mask=False, )
+        # encoded_response = tokenizer(batch_response, truncation=False, padding=False, return_attention_mask=False, )
+
+        # vocab size 小于65535 可以用 uint16, 每个样本都要添加eos_token_id
+        # input_ids = [np.array(item1 + item2 + [eos_token_id], dtype=np.uint) for item1, item2 in
+        #              (zip(encoded_prompt["input_ids"], encoded_response["input_ids"]))]
+
+        return {
+            'text': batch_prompt + batch_response,
+        }
+
+    dataset = dataset.map(tokens_to_ids, batched=True, batch_size=8192, remove_columns=dataset.column_names)
+
+    return dataset
+
+
+class MyDataCollator(DataCollatorForLanguageModeling):
+    def torch_call(self, examples: List[Union[List[int], Any, Dict[str, Any]]]) -> Dict[str, Any]:
+        batches = super().torch_call(examples)
+        batches['input_ids'] = batches['input_ids'][:, :-1]
+        batches['attention_mask'] = batches['attention_mask'][:, :-1]
+        batches['labels'] = batches['labels'][:, 1:]
+
+        return batches
+
 
 if __name__ == '__main__':
     config = TrainConfig()
-    pre_train(config)
+    # pre_train(config)
+    # config.mixed_precision = 'no'
+    pre_train_llama(config)
