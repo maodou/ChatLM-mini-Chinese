@@ -156,7 +156,7 @@ def pre_train_llama(config: TrainConfig):
 
     dataset = get_dataset_llama(file=config.train_file, split='train', tokenizer=tokenizer)
 
-    dataset = dataset.select(range(200000))
+    # dataset = dataset.select(range(200000))
 
     generation_config = GenerationConfig()
     generation_config.remove_invalid_values = True
